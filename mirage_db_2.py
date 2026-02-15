@@ -1433,6 +1433,11 @@ Only include scores >= {int(threshold)}. Reject candidates NOT at {company_name}
         return {"junior": 1, "mid": 2, "senior": 3, "manager": 4, "executive": 5}.get(seniority, 2)
 
 
+
+
+#cut here
+
+
 # =============================================================================
 # Phase 5: Bright Data Enrichment
 # =============================================================================

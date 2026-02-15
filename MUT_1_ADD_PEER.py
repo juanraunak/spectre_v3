@@ -491,6 +491,80 @@ class MutationDB:
             """, (run_id, employee_id, role_in_run, source_company_id, meta))
             return cur.rowcount > 0
 
+    # ── Insert into employee_matches (ATLAS reads this!) ──────
+    def insert_employee_match(
+        self,
+        run_id: str,
+        target_employee_id: str,
+        peer_employee_id: str,
+        peer_name: str,
+        peer_title: str,
+        peer_company: str,
+        peer_company_id: str = "",
+        match_score: float = 90.0,
+    ) -> bool:
+        """
+        Insert into spectre.employee_matches so ATLAS can find the peer.
+        ATLAS Step 2 queries employee_matches — NOT run_employees.
+        Without this row, the new peer is invisible to ATLAS.
+        """
+        rationale = json.dumps({
+            "source": "mutation_1_add_peer",
+            "method": "manual_peer_add",
+            "added_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+        # Resolve a valid match_type from the enum
+        match_type = "manual"  # fallback
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT enumlabel FROM pg_type t
+                JOIN pg_enum e ON t.oid = e.enumtypid
+                JOIN pg_namespace n ON n.oid = t.typnamespace
+                WHERE n.nspname = 'spectre' AND t.typname = 'employee_match_type'
+                ORDER BY e.enumsortorder
+            """)
+            allowed = [r["enumlabel"] for r in cur.fetchall()]
+            log.info(f"  Allowed match_type values: {allowed}")
+
+            # Pick best available
+            for preferred in ["manual", "linkedin_search", "google_search", "discovered"]:
+                if preferred in allowed:
+                    match_type = preferred
+                    break
+            else:
+                if allowed:
+                    match_type = allowed[0]
+            log.info(f"  Using match_type: '{match_type}'")
+
+        # Ensure we have a valid company_id (column is NOT NULL)
+        if not peer_company_id and peer_company:
+            cid = self.upsert_company(peer_company)
+            if cid:
+                peer_company_id = cid
+        if not peer_company_id:
+            log.warning(f"  ⚠️  No company_id — creating placeholder")
+            peer_company_id = self.upsert_company(peer_company or "Unknown") or str(uuid.uuid4())
+
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO spectre.employee_matches
+                    (run_id, employee_id, matched_employee_id,
+                     matched_name, matched_title, matched_company_id,
+                     matched_company_name,
+                     match_score, match_type, raw_json, rationale_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
+                ON CONFLICT DO NOTHING
+            """, (
+                run_id, target_employee_id, peer_employee_id,
+                peer_name, peer_title or "", peer_company_id,
+                peer_company or "",
+                match_score, match_type, rationale, rationale,
+            ))
+            inserted = cur.rowcount > 0
+        self.conn.commit()
+        return inserted
+
     # ── Employee details (SHADE-style via ComprehensiveDataManager) ──
     def insert_employee_details_from_bright(
         self,
@@ -669,17 +743,22 @@ class MutationDB:
             archive_type = f"atlas_v{current_v}"
             log.info(f"  📦 Archiving current report as report_type='{archive_type}'")
 
-            # Insert the archive copy
+            # Insert the archive copy — report_json comes back as dict from
+            # RealDictCursor+jsonb, so we must wrap it for re-insertion
+            report_json_val = row["report_json"]
+            if isinstance(report_json_val, dict) or isinstance(report_json_val, list):
+                report_json_val = json.dumps(report_json_val)
+
             cur.execute("""
                 INSERT INTO spectre.employee_reports (
                     run_id, employee_id, report_type, report_json,
                     created_at, model_name, created_by_agent,
                     report_version, created_by_mutation, mutation_summary,
                     version_created_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ) VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (run_id, employee_id, report_type) DO NOTHING
             """, (
-                run_id, employee_id, archive_type, row["report_json"],
+                run_id, employee_id, archive_type, report_json_val,
                 row["created_at"], row["model_name"], row["created_by_agent"],
                 str(current_v), row["created_by_mutation"], row["mutation_summary"],
                 row["version_created_at"] or row["created_at"],
@@ -742,6 +821,60 @@ class MutationDB:
             """, (run_id,))
             row = cur.fetchone()
             return int(row["cnt"]) if row else 0
+
+    # ── Course versioning ────────────────────────────────────
+    def get_next_course_version(self, employee_id: str) -> int:
+        """Get the next course_version for this employee."""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT COALESCE(MAX(course_version), -1) + 1 AS next_v
+                FROM spectre.employee_courses
+                WHERE employee_id = %s
+            """, (employee_id,))
+            row = cur.fetchone()
+            return row["next_v"] if row else 0
+
+    def save_course_versioned(
+        self,
+        employee_id: str,
+        course_id: str,
+        course_name: str,
+        course_version: int,
+        run_id: str,
+        created_by: str = "mutation_1_add_peer",
+        raw_json: Optional[Dict] = None,
+    ) -> bool:
+        """
+        Insert a versioned course row. Spider saves with version=0,
+        mutation saves with the correct incremented version.
+        """
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO spectre.employee_courses
+                    (employee_id, course_id, course_version, course_name,
+                     run_id, created_by, raw_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+                ON CONFLICT (employee_id, course_id, course_version) DO NOTHING
+            """, (
+                employee_id, course_id, course_version, course_name,
+                run_id, created_by,
+                json.dumps(raw_json or {}, ensure_ascii=False),
+            ))
+            inserted = cur.rowcount > 0
+        self.conn.commit()
+        return inserted
+
+    def get_latest_course_for_employee(self, employee_id: str) -> Optional[Dict[str, Any]]:
+        """Get the most recently created course for this employee."""
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                SELECT course_id, course_name, raw_json, created_at
+                FROM spectre.employee_courses
+                WHERE employee_id = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, (employee_id,))
+            return cur.fetchone()
 
     def commit(self):
         self.conn.commit()
@@ -986,6 +1119,26 @@ def run_mutation_1(
         )
         log.info(f"  ✅ Linked to run with role='{role}' (new_link={linked})")
 
+        # ── Insert into employee_matches (ATLAS reads this, NOT run_employees!) ──
+        peer_company_name = ""
+        if bright_profile:
+            peer_company_name = (
+                bright_profile.get("current_company_name")
+                or (bright_profile.get("current_company") or {}).get("name", "")
+                or ""
+            )
+        match_inserted = db.insert_employee_match(
+            run_id=run_id,
+            target_employee_id=target_employee_id,
+            peer_employee_id=peer_employee_id,
+            peer_name=peer_name,
+            peer_title=peer_title,
+            peer_company=peer_company_name,
+            peer_company_id=peer_company_id or target_company_id or "",
+            match_score=90.0,
+        )
+        log.info(f"  ✅ employee_matches row inserted={match_inserted} (ATLAS will now see this peer)")
+
         # Insert employee_details if we have a Bright profile
         if bright_profile:
             try:
@@ -1107,9 +1260,15 @@ def run_mutation_1(
 
         # ─── STEP 8: AGENT 5 — CONDITIONAL COURSE REGEN ─────
         agent5_ran = False
+        course_version_saved = None
         if gaps_changed and not skip_agent5 and SPIDER_AVAILABLE:
             log.info("\n🕷️ Step 8: Critical gaps changed → running Agent 5 (Spider) for course regen...")
             t8 = time.time()
+
+            # Get next course version BEFORE spider runs
+            next_course_v = db.get_next_course_version(target_employee_id)
+            log.info(f"  Next course version: v{next_course_v}")
+
             try:
                 # Agent 5 is async — run it in an event loop
                 loop = asyncio.new_event_loop()
@@ -1124,7 +1283,41 @@ def run_mutation_1(
                 agent5_ran = True
                 if agent5_result.get("cost"):
                     costs.record_step("agent5_spider", agent5_result["cost"])
-                log.info(f"  ✅ Agent 5 generated {agent5_result.get('courses_generated', 0)} course(s)")
+
+                courses_generated = agent5_result.get("courses_generated", 0)
+                log.info(f"  ✅ Agent 5 generated {courses_generated} course(s)")
+
+                # Spider may have saved with version=0, or may have failed to save.
+                # Either way, find the latest course and stamp it with our version.
+                latest_course = db.get_latest_course_for_employee(target_employee_id)
+                if latest_course:
+                    cid = str(latest_course["course_id"])
+                    cname = latest_course.get("course_name", "")
+                    log.info(f"  📚 Latest course: {cname} ({cid})")
+
+                    # If spider saved with version=0, insert our versioned copy
+                    if next_course_v > 0:
+                        raw = latest_course.get("raw_json") or {}
+                        saved = db.save_course_versioned(
+                            employee_id=target_employee_id,
+                            course_id=cid,
+                            course_name=cname,
+                            course_version=next_course_v,
+                            run_id=run_id,
+                            created_by="mutation_1_add_peer",
+                            raw_json=raw if isinstance(raw, dict) else {},
+                        )
+                        if saved:
+                            course_version_saved = next_course_v
+                            log.info(f"  ✅ Course saved as version={next_course_v}")
+                        else:
+                            log.info(f"  ℹ️  Course version {next_course_v} already exists (idempotent)")
+                    else:
+                        course_version_saved = 0
+                        log.info(f"  ✅ First course (version=0) saved by Spider")
+                elif courses_generated == 0:
+                    log.warning("  ⚠️  Spider failed to save course — no course found in DB")
+
             except Exception as e:
                 log.error(f"  ❌ Agent 5 failed (non-fatal): {e}")
 
@@ -1132,6 +1325,7 @@ def run_mutation_1(
                 "step": "agent5_course_regen",
                 "status": "ok" if agent5_ran else "failed",
                 "reason": "critical_gaps_changed",
+                "course_version": course_version_saved,
                 "elapsed_s": round(time.time() - t8, 2),
             })
         else:
@@ -1160,32 +1354,52 @@ def run_mutation_1(
             log.info(f"  ✅ Previous report preserved as 'atlas_v{archived_v}'")
 
         atlas_report = None
+        atlas_may_have_saved = False
+
         if ATLAS_AVAILABLE:
+            # --- 9a: Run ATLAS (it saves to DB inside build(), then prints stats) ---
             try:
                 atlas_report = run_atlas(
                     run_id=run_id,
                     employee_id=target_employee_id,
                 )
-                if atlas_report and atlas_report.get("costSummary"):
-                    costs.record_step("atlas", atlas_report["costSummary"])
-
-                # Stamp the mutation version metadata on top of ATLAS's write
-                db.stamp_report_version(
-                    run_id=run_id,
-                    employee_id=target_employee_id,
-                    new_version=new_version,
-                    peer_name=peer_name,
-                    peer_linkedin_url=peer_linkedin_url,
-                )
-                log.info(f"  ✅ ATLAS report v{new_version} saved and stamped")
+                atlas_may_have_saved = True
+                log.info(f"  ✅ ATLAS report generated")
             except Exception as e:
-                log.error(f"  ❌ ATLAS failed: {e}")
+                # ATLAS build() commits to DB BEFORE run_atlas() print statements.
+                # So if the crash is in the prints (e.g. 'multiAxisConfig' KeyError),
+                # the report IS in the DB — we just need to stamp it.
+                log.warning(f"  ⚠️  ATLAS run_atlas() raised: {e}")
+                log.warning(f"     (Report likely saved to DB — will attempt stamp anyway)")
+                atlas_may_have_saved = True  # build() commits before prints
+
+            # --- 9b: Record ATLAS cost if available ---
+            if atlas_report and atlas_report.get("costSummary"):
+                try:
+                    costs.record_step("atlas", atlas_report["costSummary"])
+                except Exception:
+                    pass
+
+            # --- 9c: ALWAYS stamp mutation metadata (even if run_atlas crashed) ---
+            # This is an UPDATE on the existing row. If ATLAS didn't save, it's a no-op.
+            if atlas_may_have_saved:
+                try:
+                    db.stamp_report_version(
+                        run_id=run_id,
+                        employee_id=target_employee_id,
+                        new_version=new_version,
+                        peer_name=peer_name,
+                        peer_linkedin_url=peer_linkedin_url,
+                    )
+                    log.info(f"  ✅ ATLAS report v{new_version} stamped as mutation_1_add_peer")
+                except Exception as stamp_err:
+                    log.error(f"  ❌ stamp_report_version failed: {stamp_err}")
         else:
             log.warning("  ⚠️  ATLAS module not available — skipping report refresh")
 
         steps_completed.append({
             "step": "atlas_report_refresh",
-            "status": "ok" if atlas_report else "failed",
+            "status": "ok" if atlas_report else ("stamped" if atlas_may_have_saved else "failed"),
             "report_version": new_version,
             "elapsed_s": round(time.time() - t9, 2),
         })

@@ -548,6 +548,10 @@ class DatabaseCourseWriter:
                     INSERT INTO spectre.employee_courses
                         (employee_id, course_id, course_name, raw_json, created_at)
                     VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (employee_id, course_id) DO UPDATE SET
+                    course_name = EXCLUDED.course_name,
+                    raw_json = EXCLUDED.raw_json,
+                    updated_at = NOW()
                     RETURNING course_id
                     """,
                     emp_uuid,

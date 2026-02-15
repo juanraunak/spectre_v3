@@ -7,13 +7,15 @@ Flow:
   3. Pull skills from employee_skills + skills tables
   4. Pull employee metadata from employees + companies
   5. Run skill-gap logic (normalize, frequency, heuristic/LLM scoring)
-  6. Write results to employee_skill_gaps
+  6. Run future-readiness analysis (AI-era market gap detection)
+  7. Write results to employee_skill_gaps
 
 Usage (CLI):
   python agent4_db_skill_gap.py --run_id <uuid>
   python agent4_db_skill_gap.py --run_id <uuid> --no_llm   # heuristic only
   python agent4_db_skill_gap.py --employee_id <uuid>
   python agent4_db_skill_gap.py --run_id <uuid> --employee_id <uuid>
+  python agent4_db_skill_gap.py --run_id <uuid> --no_future  # skip future-readiness
 
 Usage (API):
   uvicorn agent4_db_skill_gap:app --host 0.0.0.0 --port 8004
@@ -281,7 +283,7 @@ class RunDataReader:
 
 
 # ---------------------------------------------------------------------------
-# Skill Gap Engine
+# Skill Gap Engine (peer-based — UNCHANGED core logic)
 # ---------------------------------------------------------------------------
 class FractalGapEngine:
 
@@ -505,6 +507,7 @@ class FractalGapEngine:
                 "person_relevance": round(person_rel, 3),
                 "overall_relevance": round(overall, 3),
                 "gap_tier": tier,
+                "gap_source": "peer_comparison",
                 "role_family": role_family,
                 "persona": persona,
                 "competitor_count": competitor_count,
@@ -645,6 +648,597 @@ Return ONLY this JSON:
 
 
 # ---------------------------------------------------------------------------
+# Future Readiness Engine — AI-era job market skill gap detection
+# ---------------------------------------------------------------------------
+class FutureReadinessEngine:
+    """
+    Analyses the target employee's role against the evolving AI-driven job
+    market and produces 1-2 forward-looking skill gaps.
+
+    Architecture:
+      ┌─────────────────────────────────────────────────┐
+      │              FutureReadinessEngine               │
+      │                                                  │
+      │  1. Role Classification                          │
+      │     Map title → seniority band + function        │
+      │                                                  │
+      │  2. AI-Era Blueprint (heuristic OR LLM)          │
+      │     "What does the ideal <role> look like        │
+      │      in a world where AI is table-stakes?"       │
+      │                                                  │
+      │  3. Existing-Skill Leverage                      │
+      │     Which of the target's current skills are     │
+      │     transferable / amplifiable with AI?           │
+      │                                                  │
+      │  4. Gap Synthesis                                │
+      │     Produce 1-2 concrete, actionable gaps with   │
+      │     upskill reasoning tied to what they ALREADY  │
+      │     know.                                        │
+      └─────────────────────────────────────────────────┘
+
+    Every gap returned is tagged with:
+        gap_source = "future_readiness"
+    so downstream consumers can distinguish these from peer-comparison gaps.
+    """
+
+    # ── Seniority bands ──────────────────────────────────────────────────
+    SENIORITY_KEYWORDS: Dict[str, List[str]] = {
+        "c_suite": [
+            "ceo", "cto", "cfo", "cmo", "coo", "cpo", "ciso", "cro",
+            "chief", "founder", "co-founder", "managing director",
+        ],
+        "vp_director": [
+            "vp", "vice president", "director", "head of", "svp",
+            "senior vice president", "avp", "evp",
+        ],
+        "manager": [
+            "manager", "lead", "team lead", "supervisor", "principal",
+        ],
+        "senior_ic": [
+            "senior", "sr.", "staff", "senior associate", "specialist",
+        ],
+        "mid_ic": [
+            "associate", "analyst", "consultant", "executive",
+        ],
+        "junior_entry": [
+            "junior", "jr.", "intern", "trainee", "fresher", "entry",
+            "graduate", "apprentice",
+        ],
+    }
+
+    # ── Heuristic AI-era blueprints per (function × seniority) ───────────
+    # Each entry: list of (skill_name, importance, reasoning_template)
+    # Reasoning templates use {role}, {existing_skills_snippet} placeholders.
+    AI_ERA_BLUEPRINTS: Dict[str, Dict[str, List[Tuple[str, str, str]]]] = {
+        # ── ENGINEERING ──────────────────────────────────────────────────
+        "engineering": {
+            "c_suite": [
+                ("AI Strategy & Governance", "Critical",
+                 "As a {role}, setting AI adoption guardrails, model risk governance, and "
+                 "responsible-AI policy is now a board-level expectation. {leverage}"),
+                ("AI-Augmented Product Thinking", "Critical",
+                 "Modern tech leadership requires the ability to evaluate where LLMs, "
+                 "agents, and generative-AI features create vs. destroy product value. {leverage}"),
+                ("Technical Due Diligence for AI Ventures", "Important",
+                 "Evaluating AI startups, build-vs-buy for foundation models, and "
+                 "compute-cost economics is essential for capital allocation. {leverage}"),
+            ],
+            "vp_director": [
+                ("AI-Augmented Engineering Management", "Critical",
+                 "Engineering leaders now need to restructure teams around AI-assisted "
+                 "development workflows — code review with copilots, AI-driven testing, "
+                 "and productivity measurement in an AI world. {leverage}"),
+                ("LLM Application Architecture", "Critical",
+                 "Designing RAG pipelines, agent orchestration, and prompt management "
+                 "systems is a core architectural competency for engineering directors. {leverage}"),
+                ("AI Cost & Inference Optimization", "Important",
+                 "Understanding token economics, model distillation, and inference "
+                 "infrastructure is key to keeping AI features profitable. {leverage}"),
+            ],
+            "manager": [
+                ("AI-Pair Programming Workflow Design", "Critical",
+                 "Team leads must design sprint workflows that integrate AI coding "
+                 "assistants effectively — knowing when to use copilots, when to review "
+                 "AI output, and how to measure real productivity gains. {leverage}"),
+                ("Prompt Engineering & LLM Integration", "Important",
+                 "Building features that call LLM APIs, designing prompts at scale, "
+                 "and evaluating model outputs is becoming a standard IC+ expectation. {leverage}"),
+            ],
+            "senior_ic": [
+                ("AI-Assisted Software Development", "Critical",
+                 "Senior engineers who can effectively use AI coding assistants (Copilot, "
+                 "Cursor, Claude Code) ship 2-3x faster. Knowing how to prompt, validate, "
+                 "and iterate with AI tools is the new multiplier. {leverage}"),
+                ("LLM/RAG Application Development", "Critical",
+                 "Building retrieval-augmented generation systems, fine-tuning workflows, "
+                 "and agent-based architectures is the fastest-growing skill demand. {leverage}"),
+                ("AI Testing & Evaluation", "Important",
+                 "Evaluating AI model outputs, building evals, and designing human-in-the-loop "
+                 "QA pipelines is a critical emerging discipline. {leverage}"),
+            ],
+            "mid_ic": [
+                ("AI-Assisted Software Development", "Critical",
+                 "Engineers who can effectively use AI coding assistants ship significantly "
+                 "faster. Learning to prompt, validate, and iterate with AI is a career "
+                 "accelerator at every level. {leverage}"),
+                ("Prompt Engineering Fundamentals", "Important",
+                 "Understanding how to construct effective prompts, chain LLM calls, "
+                 "and handle model limitations is a baseline expectation for modern devs. {leverage}"),
+            ],
+            "junior_entry": [
+                ("AI-Assisted Software Development", "Critical",
+                 "New engineers who master AI coding tools early will learn faster and "
+                 "produce higher-quality code from day one. This is the single biggest "
+                 "career accelerator for entry-level developers. {leverage}"),
+                ("Foundational AI/ML Literacy", "Important",
+                 "Understanding how models work at a conceptual level — transformers, "
+                 "embeddings, fine-tuning — helps every engineer make better technical "
+                 "decisions, even outside ML roles. {leverage}"),
+            ],
+        },
+        # ── EXECUTIVE / C-SUITE (cross-functional) ──────────────────────
+        "exec": {
+            "c_suite": [
+                ("AI Strategy & Organizational Transformation", "Critical",
+                 "As a {role}, the ability to set enterprise AI vision, manage board "
+                 "expectations around AI ROI, and restructure organizations for human+AI "
+                 "workflows is now a defining competency. {leverage}"),
+                ("AI Risk & Responsible AI Governance", "Critical",
+                 "Regulatory landscapes (EU AI Act, evolving US frameworks) demand that "
+                 "executives understand model risk, bias auditing, and compliance. {leverage}"),
+                ("AI-Literate Capital Allocation", "Important",
+                 "Understanding compute costs, model economics, and AI vendor landscapes "
+                 "is essential for investment and M&A decisions. {leverage}"),
+            ],
+            "_default": [
+                ("AI Strategy & Organizational Transformation", "Critical",
+                 "Leaders at every level need to understand how AI reshapes their "
+                 "function — from automating workflows to augmenting decision-making. {leverage}"),
+                ("AI Literacy for Decision Makers", "Important",
+                 "Understanding AI capabilities, limitations, and ROI frameworks "
+                 "enables better strategic choices in an AI-first world. {leverage}"),
+            ],
+        },
+        # ── DATA / ML / AI ──────────────────────────────────────────────
+        "data": {
+            "c_suite": [
+                ("AI/ML Strategy for Data Organizations", "Critical",
+                 "Data leaders must transition from descriptive analytics to prescriptive "
+                 "AI — owning the model lifecycle, MLOps, and AI product strategy. {leverage}"),
+                ("Generative AI for Data Products", "Critical",
+                 "Building natural-language interfaces to data, AI-powered reporting, "
+                 "and self-service analytics using LLMs is the next frontier. {leverage}"),
+            ],
+            "_default": [
+                ("LLM Fine-Tuning & Prompt Engineering", "Critical",
+                 "Data professionals who can fine-tune models, build evals, and design "
+                 "prompt pipelines are in unprecedented demand. {leverage}"),
+                ("AI Agent & Orchestration Frameworks", "Important",
+                 "Building multi-step AI agents (LangChain, LangGraph, CrewAI) that "
+                 "automate complex analytical workflows is a key differentiator. {leverage}"),
+                ("Responsible AI & Model Evaluation", "Important",
+                 "Understanding bias detection, fairness metrics, and model governance "
+                 "is essential as AI becomes embedded in decision systems. {leverage}"),
+            ],
+        },
+        # ── PRODUCT ──────────────────────────────────────────────────────
+        "product": {
+            "_default": [
+                ("AI Product Management", "Critical",
+                 "Product managers who understand how to spec AI features, write model "
+                 "evaluation criteria, and design human-AI interaction flows are the "
+                 "most sought-after PMs in the market. {leverage}"),
+                ("Prompt Design & UX for AI Features", "Important",
+                 "Designing user experiences around AI uncertainty, hallucination "
+                 "management, and progressive disclosure of AI capabilities is a "
+                 "new core PM skill. {leverage}"),
+            ],
+        },
+        # ── MARKETING ────────────────────────────────────────────────────
+        "marketing": {
+            "_default": [
+                ("AI-Powered Content & Campaign Automation", "Critical",
+                 "Marketers who can orchestrate AI for personalized content generation, "
+                 "A/B testing at scale, and dynamic creative optimization have a massive "
+                 "edge. {leverage}"),
+                ("Marketing Analytics with AI/ML", "Important",
+                 "Using predictive models for customer segmentation, LTV forecasting, "
+                 "and attribution in a cookieless world is increasingly table-stakes. {leverage}"),
+            ],
+        },
+        # ── SALES ────────────────────────────────────────────────────────
+        "sales": {
+            "_default": [
+                ("AI-Augmented Sales Workflows", "Critical",
+                 "Sales professionals who leverage AI for prospect research, personalized "
+                 "outreach, call intelligence, and deal scoring consistently outperform "
+                 "peers. {leverage}"),
+                ("Conversational AI & Sales Enablement", "Important",
+                 "Understanding how AI chatbots, voice agents, and automated follow-ups "
+                 "fit into the sales funnel is a key differentiator. {leverage}"),
+            ],
+        },
+        # ── FINANCE ──────────────────────────────────────────────────────
+        "finance": {
+            "_default": [
+                ("AI-Augmented Financial Analysis", "Critical",
+                 "Finance professionals who use AI for forecasting, anomaly detection, "
+                 "and automated reporting produce faster, more accurate insights. {leverage}"),
+                ("AI Risk Modeling & Compliance Automation", "Important",
+                 "Understanding AI-driven credit scoring, fraud detection, and regulatory "
+                 "compliance automation is increasingly essential. {leverage}"),
+            ],
+        },
+        # ── RISK / CREDIT (BFSI-specific) ───────────────────────────────
+        "risk": {
+            "_default": [
+                ("AI/ML-Driven Risk Modeling", "Critical",
+                 "The shift from traditional scorecards to ML-based risk models (XGBoost, "
+                 "neural nets for credit, NLP for document review) is transforming the "
+                 "risk function. {leverage}"),
+                ("Automated Underwriting & Decision Systems", "Important",
+                 "Understanding AI-powered straight-through processing, automated "
+                 "decisioning, and exception handling is critical for modern risk roles. {leverage}"),
+            ],
+        },
+        # ── OPS ──────────────────────────────────────────────────────────
+        "ops": {
+            "_default": [
+                ("AI Process Automation & Orchestration", "Critical",
+                 "Operations leaders who can identify automation opportunities, deploy "
+                 "AI agents for workflow orchestration, and measure ROI on AI-driven "
+                 "process improvements are in high demand. {leverage}"),
+                ("Data-Driven Operations with AI", "Important",
+                 "Using predictive analytics for demand planning, supply chain "
+                 "optimization, and capacity management is the new ops baseline. {leverage}"),
+            ],
+        },
+        # ── GENERIC FALLBACK ─────────────────────────────────────────────
+        "generic": {
+            "_default": [
+                ("AI Literacy & Tool Proficiency", "Critical",
+                 "Professionals across every function who understand AI capabilities, "
+                 "can use AI tools effectively (ChatGPT, Claude, Copilot, etc.), and "
+                 "know how to evaluate AI outputs have a significant career advantage. {leverage}"),
+                ("AI-Augmented Workflow Design", "Important",
+                 "The ability to identify which parts of your work can be automated or "
+                 "augmented by AI — and design new workflows around it — is the meta-skill "
+                 "of the AI era. {leverage}"),
+            ],
+        },
+    }
+
+    # Maximum future-readiness gaps to produce
+    MAX_FUTURE_GAPS = 2
+
+    def __init__(self, use_llm: bool = True, client=None, deployment_id: str = None,
+                 run_cost: Optional[RunCost] = None):
+        self.use_llm = use_llm
+        self.client = client
+        self.deployment_id = deployment_id
+        self.run_cost = run_cost or RunCost()
+
+    # ── Role classification ──────────────────────────────────────────────
+
+    @staticmethod
+    def classify_seniority(title: str) -> str:
+        """Map a job title to a seniority band."""
+        t = (title or "").lower().strip()
+        if not t:
+            return "mid_ic"
+        for band, keywords in FutureReadinessEngine.SENIORITY_KEYWORDS.items():
+            for kw in keywords:
+                if kw in t:
+                    return band
+        return "mid_ic"
+
+    # ── Existing-skill leverage snippet ──────────────────────────────────
+
+    @staticmethod
+    def _build_leverage_snippet(existing_skills: Set[str], gap_skill: str) -> str:
+        """
+        Find the target's existing skills that are most transferable to the
+        gap skill and build a short 'leverage' sentence.
+        """
+        # Broad affinity mappings: if target has any of these, they have a
+        # stepping stone toward the gap skill.
+        AFFINITY_MAP: Dict[str, List[str]] = {
+            "ai": ["python", "machine learning", "data science", "deep learning",
+                    "tensorflow", "pytorch", "statistics", "data analysis",
+                    "natural language processing", "computer vision"],
+            "prompt": ["writing", "content", "copywriting", "technical writing",
+                       "communication", "nlp", "natural language processing"],
+            "llm": ["python", "machine learning", "nlp", "natural language processing",
+                    "data science", "api", "software development"],
+            "automation": ["python", "scripting", "devops", "ci cd", "workflow",
+                          "process improvement", "rpa"],
+            "strategy": ["strategic planning", "business development", "consulting",
+                        "management", "leadership", "p&l", "business strategy"],
+            "governance": ["compliance", "risk management", "audit", "regulatory",
+                          "legal", "policy"],
+            "analytics": ["sql", "excel", "data analysis", "tableau", "power bi",
+                         "statistics", "reporting", "data visualization"],
+            "product": ["product management", "agile", "scrum", "user research",
+                       "ux", "roadmap", "jira"],
+        }
+
+        gap_lower = gap_skill.lower()
+        relevant_affinities: Set[str] = set()
+        for key, terms in AFFINITY_MAP.items():
+            if key in gap_lower:
+                relevant_affinities.update(terms)
+
+        # Also do fuzzy: any existing skill that shares 3+ char overlap with gap
+        bridges: List[str] = []
+        for es in existing_skills:
+            es_l = es.lower()
+            if es_l in relevant_affinities:
+                bridges.append(es)
+            elif SequenceMatcher(None, es_l, gap_lower).ratio() > 0.35:
+                bridges.append(es)
+
+        bridges = bridges[:4]  # cap at 4
+
+        if bridges:
+            joined = ", ".join(bridges)
+            return (
+                f"Your existing skills in {joined} provide a strong foundation — "
+                f"building on these will accelerate your growth in this area."
+            )
+        return (
+            "While this may be a new area, developing this skill will "
+            "significantly differentiate you in today's AI-driven market."
+        )
+
+    # ── Heuristic path ───────────────────────────────────────────────────
+
+    def _heuristic_future_gaps(
+        self, target: EmployeeProfile, existing_skills: Set[str],
+        peer_gap_names: Set[str],
+    ) -> List[SkillGapResult]:
+        """
+        Use the static AI_ERA_BLUEPRINTS to pick the most relevant
+        future-readiness gaps for this role.
+        """
+        role_family = FractalGapEngine.get_role_family(target.current_title)
+        seniority = self.classify_seniority(target.current_title)
+
+        log.info(f"[FutureReadiness/heuristic] role_family={role_family}, "
+                 f"seniority={seniority}")
+
+        # Look up blueprint: try (family, seniority), then (family, _default),
+        # then ("generic", _default)
+        family_map = self.AI_ERA_BLUEPRINTS.get(role_family, {})
+        blueprint = (
+            family_map.get(seniority)
+            or family_map.get("_default")
+            or self.AI_ERA_BLUEPRINTS["generic"]["_default"]
+        )
+
+        results: List[SkillGapResult] = []
+        for skill_name, importance, reasoning_tpl in blueprint:
+            # Skip if the target already has this skill (fuzzy match)
+            skill_norm = FractalGapEngine.normalize_skill(skill_name)
+            already_has = any(
+                SequenceMatcher(None, skill_norm, es).ratio() > 0.65
+                for es in existing_skills
+            )
+            if already_has:
+                log.info(f"  [skip] Target already has '{skill_name}' (or similar)")
+                continue
+
+            # Skip if this is already covered by a peer-comparison gap
+            already_peer_gap = any(
+                SequenceMatcher(None, skill_norm, pg).ratio() > 0.65
+                for pg in peer_gap_names
+            )
+            if already_peer_gap:
+                log.info(f"  [skip] '{skill_name}' already covered by peer gap")
+                continue
+
+            leverage = self._build_leverage_snippet(existing_skills, skill_name)
+            reasoning = reasoning_tpl.format(
+                role=target.current_title or "this role",
+                leverage=leverage,
+            )
+
+            results.append(SkillGapResult(
+                employee_id=target.employee_id,
+                skill_id=None,
+                skill_gap_name=skill_name,
+                skill_importance=importance,
+                gap_reasoning=reasoning,
+                competitor_companies=[],
+                raw_json={
+                    "gap_source": "future_readiness",
+                    "gap_tier": importance,
+                    "overall_relevance": 0.85 if importance == "Critical" else 0.65,
+                    "role_family": role_family,
+                    "seniority_band": seniority,
+                    "persona": FractalGapEngine.infer_persona(target.current_title),
+                    "analysis_method": "heuristic_blueprint",
+                    "leverage_skills": [s for s in existing_skills][:10],
+                },
+            ))
+
+            if len(results) >= self.MAX_FUTURE_GAPS:
+                break
+
+        return results
+
+    # ── LLM-enhanced path ────────────────────────────────────────────────
+
+    def _llm_future_gaps(
+        self, target: EmployeeProfile, existing_skills: Set[str],
+        peer_gap_names: Set[str],
+    ) -> List[SkillGapResult]:
+        """
+        Use the LLM to dynamically research what the AI-era version of
+        this person's role looks like, then produce targeted gaps.
+        """
+        role_family = FractalGapEngine.get_role_family(target.current_title)
+        seniority = self.classify_seniority(target.current_title)
+        persona = FractalGapEngine.infer_persona(target.current_title)
+
+        existing_list = sorted(existing_skills)[:30]
+        peer_gap_list = sorted(peer_gap_names)[:15]
+
+        prompt = f"""You are a world-class career strategist and AI workforce analyst.
+
+CONTEXT:
+- Target person: {target.full_name}
+- Current role: {target.current_title or "Unknown"}
+- Company: {target.company_name or "Unknown"}
+- Seniority band: {seniority}
+- Role function: {role_family}
+- Their current skills ({len(existing_list)} shown): {json.dumps(existing_list, ensure_ascii=False)}
+- Peer-comparison gaps already identified: {json.dumps(peer_gap_list, ensure_ascii=False)}
+
+TASK:
+The AI revolution is transforming every role. Analyze what the IDEAL version of
+"{target.current_title or 'this role'}" looks like in today's AI-driven job market
+(2025 and beyond), then identify 1-2 CRITICAL future-readiness skill gaps that:
+
+1. Are NOT already in their current skills
+2. Are NOT already in the peer-comparison gaps listed above
+3. Are specific and actionable (not vague like "be innovative")
+4. Directly relate to how AI is transforming THIS SPECIFIC role at THIS seniority level
+5. Include concrete reasoning about HOW their existing skills can be leveraged to
+   build this new capability
+
+For each gap, explain:
+- WHY this skill matters for their specific role in an AI world
+- WHAT existing skills of theirs serve as a foundation
+- HOW they can start building this skill
+
+Return ONLY this JSON (no markdown, no backticks):
+{{
+  "future_gaps": [
+    {{
+      "skill_name": "concise skill name (3-6 words max)",
+      "importance": "Critical" or "Important",
+      "reasoning": "2-3 sentences: why this matters for their role + how their existing skills help + actionable next step",
+      "leverage_skills": ["existing_skill_1", "existing_skill_2"]
+    }}
+  ]
+}}
+
+Rules:
+- Return 1-2 gaps MAXIMUM
+- Every gap MUST relate to AI's impact on their role
+- Be specific to their seniority: a CEO needs strategy skills, a junior dev needs tool skills
+- The skill_name should be concise and professional (will be stored in a database)
+- Reasoning should reference their actual existing skills where possible"""
+
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.deployment_id,
+                messages=[
+                    {"role": "system",
+                     "content": "You are an AI workforce analyst. Return ONLY valid JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.3,
+                max_tokens=1500,
+                response_format={"type": "json_object"},
+            )
+
+            # Track costs
+            usage = getattr(resp, "usage", None)
+            if usage:
+                self.run_cost.record_usage(
+                    int(getattr(usage, "prompt_tokens", 0)),
+                    int(getattr(usage, "completion_tokens", 0)),
+                    model=self.deployment_id or "",
+                )
+                if tracker:
+                    tracker.track_gpt_tokens(
+                        int(getattr(usage, "prompt_tokens", 0)),
+                        int(getattr(usage, "completion_tokens", 0)),
+                    )
+
+            raw = (resp.choices[0].message.content or "").strip()
+            data = json.loads(raw.replace("```json", "").replace("```", "").strip())
+            future_gaps = data.get("future_gaps", [])
+
+            results: List[SkillGapResult] = []
+            for gap in future_gaps[:self.MAX_FUTURE_GAPS]:
+                skill_name = (gap.get("skill_name") or "").strip()
+                if not skill_name:
+                    continue
+
+                importance = gap.get("importance", "Important")
+                if importance not in ("Critical", "Important", "Nice-to-have"):
+                    importance = "Important"
+
+                reasoning = (gap.get("reasoning") or "").strip()
+                leverage_skills = gap.get("leverage_skills", [])
+
+                results.append(SkillGapResult(
+                    employee_id=target.employee_id,
+                    skill_id=None,
+                    skill_gap_name=skill_name,
+                    skill_importance=importance,
+                    gap_reasoning=reasoning,
+                    competitor_companies=[],
+                    raw_json={
+                        "gap_source": "future_readiness",
+                        "gap_tier": importance,
+                        "overall_relevance": 0.90 if importance == "Critical" else 0.70,
+                        "role_family": role_family,
+                        "seniority_band": seniority,
+                        "persona": persona,
+                        "analysis_method": "llm_market_analysis",
+                        "leverage_skills": leverage_skills,
+                        "llm_enhanced": True,
+                    },
+                ))
+
+            log.info(f"[FutureReadiness/LLM] Generated {len(results)} future gaps")
+            return results
+
+        except Exception as e:
+            log.warning(f"[FutureReadiness/LLM] Failed: {e}; falling back to heuristic")
+            return self._heuristic_future_gaps(target, existing_skills, peer_gap_names)
+
+    # ── Public interface ─────────────────────────────────────────────────
+
+    def analyze(
+        self, target: EmployeeProfile, existing_skills: Set[str],
+        peer_gap_names: Set[str],
+    ) -> List[SkillGapResult]:
+        """
+        Main entry point. Returns 1-2 future-readiness skill gaps for the
+        target employee based on how AI is transforming their role.
+
+        Args:
+            target: The target employee profile.
+            existing_skills: Normalized set of the target's current skills.
+            peer_gap_names: Set of skill names already identified by peer-comparison
+                           (to avoid duplicates).
+
+        Returns:
+            List of SkillGapResult with gap_source="future_readiness" in raw_json.
+        """
+        log.info(f"[FutureReadiness] Analyzing {target.full_name} — "
+                 f"{target.current_title} ({len(existing_skills)} skills)")
+
+        if self.use_llm and self.client:
+            results = self._llm_future_gaps(target, existing_skills, peer_gap_names)
+        else:
+            results = self._heuristic_future_gaps(target, existing_skills, peer_gap_names)
+
+        if not results:
+            log.info("[FutureReadiness] No new future gaps (target may already be well-positioned)")
+        else:
+            log.info(f"[FutureReadiness] {len(results)} future-readiness gaps:")
+            for i, g in enumerate(results, 1):
+                log.info(f"  {i}. [{g.skill_importance}] {g.skill_gap_name}")
+
+        return results
+
+
+# ---------------------------------------------------------------------------
 # DB Writer
 # ---------------------------------------------------------------------------
 class GapWriter:
@@ -709,11 +1303,30 @@ class GapWriter:
             with self.conn.cursor() as cur:
                 for name in missing_names:
                     new_id = str(uuid.uuid4())
+                    # Determine category based on gap source
+                    matching_results = [r for r in results if r.skill_gap_name == name]
+                    is_future = any(
+                        r.raw_json.get("gap_source") == "future_readiness"
+                        for r in matching_results
+                    )
+                    category = "ai-era-readiness" if is_future else "auto-detected"
+
+                    # Build metadata with description for future-readiness skills
+                    metadata = {}
+                    if is_future and matching_results:
+                        metadata["description"] = matching_results[0].gap_reasoning
+                        metadata["gap_source"] = "future_readiness"
+                        metadata["analysis_method"] = matching_results[0].raw_json.get(
+                            "analysis_method", "unknown"
+                        )
+
                     cur.execute("""
                         INSERT INTO spectre.skills (skill_id, name, category, metadata_json, raw_json, created_at)
-                        VALUES (%s, %s, %s, '{}'::jsonb, '{}'::jsonb, %s)
+                        VALUES (%s, %s, %s, %s::jsonb, '{}'::jsonb, %s)
                         ON CONFLICT DO NOTHING RETURNING skill_id
-                    """, (new_id, name, "auto-detected", datetime.now(timezone.utc)))
+                    """, (new_id, name, category,
+                          json.dumps(metadata, ensure_ascii=False),
+                          datetime.now(timezone.utc)))
                     row = cur.fetchone()
                     if row:
                         existing[name.lower()] = str(row[0])
@@ -791,11 +1404,13 @@ def resolve_run_ids(run_id: Optional[str], employee_id: Optional[str]) -> List[s
 
 
 def run_agent4(run_id: str, use_llm: bool = True, employee_id: Optional[str] = None,
-               azure_config: Optional[Dict] = None) -> Tuple[List[SkillGapResult], RunCost]:
+               azure_config: Optional[Dict] = None,
+               skip_future: bool = False) -> Tuple[List[SkillGapResult], RunCost]:
     log.info(f"{'=' * 60}")
     log.info(f"Agent 4 — Skill Gap Analysis")
     log.info(f"Run ID: {run_id} | Employee ID: {employee_id or 'auto'}")
-    log.info(f"LLM: {'enabled' if use_llm else 'disabled'}")
+    log.info(f"LLM: {'enabled' if use_llm else 'disabled'} | "
+             f"Future-readiness: {'disabled' if skip_future else 'enabled'}")
     log.info(f"{'=' * 60}")
 
     conn = get_connection()
@@ -818,31 +1433,57 @@ def run_agent4(run_id: str, use_llm: bool = True, employee_id: Optional[str] = N
             log.info(f"  Comp #{i}: {c.full_name} — {c.current_title} "
                      f"@ {c.company_name} ({len(c.skills)} skills)")
 
+        # ── Phase 1: Peer-comparison gaps (original core logic) ──────────
         engine = FractalGapEngine(use_llm=use_llm, azure_config=azure_config)
         gap_results = engine.compute_gaps(target, competitors)
         run_cost = engine.run_cost
 
         if gap_results:
-            log.info(f"--- Top gaps for {target.full_name} ---")
+            log.info(f"--- Peer-based gaps for {target.full_name} ---")
             for i, g in enumerate(gap_results[:10], 1):
                 log.info(f"  {i}. [{g.skill_importance}] {g.skill_gap_name}")
 
-        # Log cost summary
+        # ── Phase 2: Future-readiness gaps (new AI-era analysis) ─────────
+        if not skip_future:
+            existing_skills = engine.extract_skills(target)
+            peer_gap_names = {g.skill_gap_name for g in gap_results}
+
+            future_engine = FutureReadinessEngine(
+                use_llm=use_llm,
+                client=engine.client,
+                deployment_id=engine.deployment_id,
+                run_cost=run_cost,
+            )
+            future_gaps = future_engine.analyze(target, existing_skills, peer_gap_names)
+
+            if future_gaps:
+                log.info(f"--- Future-readiness gaps for {target.full_name} ---")
+                for i, g in enumerate(future_gaps, 1):
+                    log.info(f"  {i}. [{g.skill_importance}] {g.skill_gap_name}")
+                gap_results.extend(future_gaps)
+        else:
+            log.info("Future-readiness analysis skipped (--no_future)")
+
+        # ── Cost summary ─────────────────────────────────────────────────
         if run_cost.llm_calls > 0:
             log.info(f"LLM cost: {run_cost.llm_calls} call(s), "
                      f"{run_cost.total_tokens} tokens, ${run_cost.cost_usd:.6f}")
         else:
             log.info("LLM cost: $0 (heuristic only)")
 
+        # ── Write all gaps (peer + future) to DB ─────────────────────────
         writer = GapWriter(conn)
         writer.write_gaps(
             run_id=run_id,
             results=gap_results,
             agent_name="agent4_db",
-            model_name="fractal_heuristic" + ("+llm" if use_llm else ""),
+            model_name="fractal_heuristic" + ("+llm" if use_llm else "") +
+                       ("" if skip_future else "+future_readiness"),
         )
 
-        log.info(f"Agent 4 complete for run {run_id}")
+        log.info(f"Agent 4 complete for run {run_id} "
+                 f"(peer_gaps={len(gap_results) - len(future_gaps if not skip_future and 'future_gaps' in dir() else [])}, "
+                 f"future_gaps={len(future_gaps) if not skip_future and 'future_gaps' in dir() else 0})")
         return gap_results, run_cost
     finally:
         conn.close()
@@ -859,6 +1500,7 @@ async def run(context: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("run_id or employee_id is required in context.inputs")
 
     use_llm = inputs.get("use_llm", True)
+    skip_future = inputs.get("skip_future", False)
     azure_config = inputs.get("azure_config")
     db_cfg = inputs.get("db_config", {})
     if db_cfg:
@@ -868,7 +1510,8 @@ async def run(context: Dict[str, Any]) -> Dict[str, Any]:
     total_gaps = 0
     total_cost = RunCost()
     for rid in run_ids:
-        results, cost = run_agent4(rid, use_llm=use_llm, employee_id=employee_id, azure_config=azure_config)
+        results, cost = run_agent4(rid, use_llm=use_llm, employee_id=employee_id,
+                                    azure_config=azure_config, skip_future=skip_future)
         total_gaps += len(results) if results else 0
         total_cost.record_usage(cost.prompt_tokens, cost.completion_tokens, cost.model_name)
 
@@ -890,13 +1533,14 @@ def run_sync(context: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # FastAPI
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Agent 4 — Skill Gap Analyzer", version="1.0.0")
+app = FastAPI(title="Agent 4 — Skill Gap Analyzer", version="2.0.0")
 
 
 class AnalyzeRequest(BaseModel):
     run_id: Optional[str] = None
     employee_id: Optional[str] = None
     use_llm: bool = True
+    skip_future: bool = False
 
 
 class GapItem(BaseModel):
@@ -905,6 +1549,7 @@ class GapItem(BaseModel):
     gap_reasoning: str
     competitor_companies: List[str]
     overall_relevance: Optional[float] = None
+    gap_source: Optional[str] = None
 
 
 class CostInfo(BaseModel):
@@ -919,6 +1564,8 @@ class CostInfo(BaseModel):
 class AnalyzeResponse(BaseModel):
     run_ids_processed: List[str]
     total_gaps: int
+    peer_gaps: int
+    future_readiness_gaps: int
     gaps: Dict[str, List[GapItem]]
     cost: CostInfo
 
@@ -930,6 +1577,7 @@ def api_analyze(req: AnalyzeRequest):
       - run_id only       → analyze that specific run
       - employee_id only  → find all runs where employee is target, analyze each
       - both              → analyze the given run_id
+      - skip_future=true  → skip AI-era future-readiness analysis
     """
     if not req.run_id and not req.employee_id:
         raise HTTPException(status_code=400, detail="At least one of run_id or employee_id is required")
@@ -941,21 +1589,31 @@ def api_analyze(req: AnalyzeRequest):
 
     all_gaps: Dict[str, List[GapItem]] = {}
     total = 0
+    total_peer = 0
+    total_future = 0
     total_cost = RunCost()
     for rid in run_ids:
         try:
-            results, cost = run_agent4(rid, use_llm=req.use_llm, employee_id=req.employee_id)
+            results, cost = run_agent4(
+                rid, use_llm=req.use_llm, employee_id=req.employee_id,
+                skip_future=req.skip_future,
+            )
             total_cost.record_usage(cost.prompt_tokens, cost.completion_tokens, cost.model_name)
-            items = [
-                GapItem(
+            items = []
+            for r in results:
+                gap_source = r.raw_json.get("gap_source", "peer_comparison")
+                items.append(GapItem(
                     skill_gap_name=r.skill_gap_name,
                     skill_importance=r.skill_importance,
                     gap_reasoning=r.gap_reasoning,
                     competitor_companies=r.competitor_companies,
                     overall_relevance=r.raw_json.get("overall_relevance"),
-                )
-                for r in results
-            ]
+                    gap_source=gap_source,
+                ))
+                if gap_source == "future_readiness":
+                    total_future += 1
+                else:
+                    total_peer += 1
             all_gaps[rid] = items
             total += len(items)
         except Exception as e:
@@ -965,6 +1623,8 @@ def api_analyze(req: AnalyzeRequest):
     return AnalyzeResponse(
         run_ids_processed=run_ids,
         total_gaps=total,
+        peer_gaps=total_peer,
+        future_readiness_gaps=total_future,
         gaps=all_gaps,
         cost=CostInfo(**total_cost.to_dict()),
     )
@@ -972,7 +1632,8 @@ def api_analyze(req: AnalyzeRequest):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "agent": "agent4_db_skill_gap"}
+    return {"status": "ok", "agent": "agent4_db_skill_gap", "version": "2.0.0",
+            "features": ["peer_comparison", "future_readiness"]}
 
 
 # ---------------------------------------------------------------------------
@@ -983,6 +1644,8 @@ if __name__ == "__main__":
     p.add_argument("--run_id", default=None, help="UUID of the run to analyze")
     p.add_argument("--employee_id", default=None, help="UUID of the employee to analyze")
     p.add_argument("--no_llm", action="store_true", help="Disable LLM-enhanced scoring")
+    p.add_argument("--no_future", action="store_true",
+                   help="Skip AI-era future-readiness analysis")
     p.add_argument("--db_host", default=None, help="Override DB host")
     p.add_argument("--db_user", default=None, help="Override DB user")
     p.add_argument("--db_password", default=None, help="Override DB password")
@@ -1009,7 +1672,9 @@ if __name__ == "__main__":
         run_ids = resolve_run_ids(args.run_id, args.employee_id)
         total_cost = RunCost()
         for rid in run_ids:
-            _, cost = run_agent4(rid, use_llm=not args.no_llm, employee_id=args.employee_id)
+            _, cost = run_agent4(rid, use_llm=not args.no_llm,
+                                 employee_id=args.employee_id,
+                                 skip_future=args.no_future)
             total_cost.record_usage(cost.prompt_tokens, cost.completion_tokens, cost.model_name)
         if total_cost.llm_calls > 0:
             log.info(f"Total cost across {len(run_ids)} run(s): "
