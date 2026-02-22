@@ -75,8 +75,7 @@ DEBUG_MIRAGE = os.getenv("MIRAGE_DEBUG", "1") == "1"
 # =============================================================================
 NUM_COMPETITORS = 7           # Number of competitor companies to detect
 BUSINESS_MODEL = "b2c"        # "b2c" or "b2b"
-TOP_K_MATCHES = 8             # Final matches written to DB (shown to downstream pipeline)
-TOP_K_CANDIDATES = 20         # Candidate pool surfaced to user for interactive selection
+TOP_K_MATCHES = 7             # Total top matches to return
 MATCHES_PER_COMPANY = 1       # Max matches to take from each company
 
 
@@ -1622,46 +1621,6 @@ class MirageDBWriter:
                 (run_id, employee_id, role, None, Json({})),
             )
 
-    def save_candidate_pool(self, run_id: str, candidates: List[Dict]):
-        """Persist the discovered candidate pool and mark run as awaiting user confirmation."""
-        with self.conn.cursor() as cur:
-            cur.execute(
-                """UPDATE spectre.runs
-                   SET candidate_pool     = %s,
-                       interaction_status = 'discovery_complete'
-                   WHERE run_id = %s""",
-                (Json(candidates), run_id),
-            )
-        logger.info(f"[DB] Saved {len(candidates)} candidates to pool for run {run_id}")
-
-    def load_candidate_pool(self, run_id: str) -> List[Dict]:
-        """Load the previously saved candidate pool for a run."""
-        with self.conn.cursor() as cur:
-            cur.execute(
-                "SELECT candidate_pool, interaction_status FROM spectre.runs WHERE run_id = %s",
-                (run_id,),
-            )
-            row = cur.fetchone()
-        if not row:
-            raise ValueError(f"Run not found: {run_id}")
-        if row["interaction_status"] != "discovery_complete":
-            raise ValueError(
-                f"Run {run_id} is not in 'discovery_complete' state "
-                f"(current: {row['interaction_status']}). "
-                "Run discovery first via POST /peers/discover."
-            )
-        pool = row["candidate_pool"] or []
-        logger.info(f"[DB] Loaded {len(pool)} candidates from pool for run {run_id}")
-        return pool
-
-    def mark_confirmed(self, run_id: str):
-        """Mark the run as user-confirmed (enrichment is about to start)."""
-        with self.conn.cursor() as cur:
-            cur.execute(
-                "UPDATE spectre.runs SET interaction_status = 'confirmed' WHERE run_id = %s",
-                (run_id,),
-            )
-
     def write_matches(self, run_id: str, matches: List[EmployeeMatch]):
         logger.info(f"[DB] Writing {len(matches)} matches")
         with self.conn.cursor() as cur:
@@ -1848,31 +1807,27 @@ class MirageHybridSystem:
         self.db_writer = MirageDBWriter(self.conn)
         logger.info("MIRAGE Hybrid System v7.0 initialized")
 
-    async def run_discovery_phase(
+    async def run_full_analysis(
         self, employee_id: Optional[str] = None, run_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Phase 0–4: Resolve target, detect competitors, discover & score candidates.
-
-        Saves the full candidate pool (up to TOP_K_CANDIDATES) to
-        spectre.runs.candidate_pool and sets interaction_status =
-        'discovery_complete'.  Returns the candidate list so the caller
-        (API or CLI) can present them to the user.
-
-        The run_id is unchanged throughout — downstream pipeline is unaffected.
-        """
         if not employee_id and not run_id:
             raise ValueError("Must provide employee_id, run_id, or both")
 
         start_time = time.time()
         logger.info("=" * 80)
-        logger.info("MIRAGE — DISCOVERY PHASE START (v7.0)")
+        logger.info("MIRAGE HYBRID ANALYSIS START (v7.0)")
+        logger.info(f"  Competitors: {NUM_COMPETITORS}  |  Mode: {BUSINESS_MODEL}  |  "
+                     f"Top matches: {TOP_K_MATCHES}  |  Per company: {MATCHES_PER_COMPANY}")
         logger.info("=" * 80)
 
         # ── Phase 0: Resolve target + run_id ──
+        # Priority: if run_id given, resolve employee from it.
+        #           if employee_id given, find existing run from DB.
         if run_id and not employee_id:
+            # run_id only → look up employee from the run
             employee_id, target_context = self.target_resolver.resolve_from_run_id(run_id)
         elif employee_id and not run_id:
+            # employee_id only → resolve target, find existing run
             target_context = self.target_resolver.resolve_target_from_employee_id(employee_id)
             run_id = self.target_resolver.find_existing_run(employee_id)
             if not run_id:
@@ -1881,24 +1836,27 @@ class MirageHybridSystem:
                     "Please provide a run_id or create a run first."
                 )
         else:
+            # Both provided → use run_id, resolve employee
             target_context = self.target_resolver.resolve_target_from_employee_id(employee_id)
 
-        logger.info(f"[Phase 0] run_id: {run_id}")
+        logger.info(f"[Phase 0] Using run_id: {run_id}")
         logger.info(f"[Phase 0] Target: {target_context['employee_name']} at {target_context['company_name']}")
 
         target_company_id = target_context["current_company_id"]
         target_company_name = target_context["company_name"]
 
+        # Update existing run status to in_progress
         self.db_writer.update_run_status(run_id, "in_progress")
         self.db_writer.add_company_to_run(run_id, target_company_id, "target")
         self.db_writer.add_employee_to_run(run_id, employee_id, "target")
 
-        # ── Phase 1: Competitor detection ──
+        # Phase 1: Detect competitors (region-aware)
         emp_location = target_context["employee_data"].get("location") or ""
         company_region = target_context["company_data"].get("metadata_json") or {}
         if isinstance(company_region, str):
             company_region = json.loads(company_region)
         region = emp_location or company_region.get("region", "") or company_region.get("country", "")
+        logger.info(f"[Phase 1] Detected region: {region or 'none'}")
 
         competitors = self.competitor_detector.detect_competitors(
             company_name=target_company_name,
@@ -1916,22 +1874,24 @@ class MirageHybridSystem:
 
         logger.info(f"Detected {len(competitors)} competitors: {[c.name for c in competitors]}")
 
-        # ── Phase 2: Target profile ──
+        # Phase 2: Build target profile
         target_profile = self.profile_builder.build_profile_from_db(target_context)
+        dbg("Target profile", {
+            "name": target_profile.name, "title": target_profile.title,
+            "department": target_profile.department, "seniority": target_profile.seniority_level,
+            "skills": target_profile.key_skills[:10],
+        })
 
-        # ── Phase 3+4: Parallel search + match ──
-        # We ask for more candidates per company so the pool is rich enough for
-        # the user to choose from (TOP_K_CANDIDATES total, not just TOP_K_MATCHES).
-        candidates_per_company = max(2, TOP_K_CANDIDATES // max(len(competitors), 1))
+        # Phase 3+4: Parallel search + match (MATCHES_PER_COMPANY per company)
         self.employee_finder._current_run_id = run_id
         competitor_employees_map, matches_by_company = await self.employee_finder.search_and_match_parallel(
             target_profile=target_profile, competitors=competitors,
             matcher=self.matcher, business_model=BUSINESS_MODEL,
-            top_k_per_company=candidates_per_company, score_threshold=40.0,
+            top_k_per_company=MATCHES_PER_COMPANY, score_threshold=40.0,
             max_concurrent_companies=4,
         )
 
-        # Write discovered employees to DB (idempotent)
+        # Write discovered employees to DB
         all_competitor_employees: List[CompetitorEmployee] = []
         for comp in competitors:
             emps = competitor_employees_map.get(comp.name, [])
@@ -1943,7 +1903,7 @@ class MirageHybridSystem:
                 competitor_employees_map[comp.name] = emps
             all_competitor_employees.extend(emps)
 
-        # Hydrate matched_employee_id from written DB records
+        # Update match employee_ids from DB-written employees
         emp_by_url: Dict[str, CompetitorEmployee] = {}
         for emp in all_competitor_employees:
             if emp.employee_id and emp.linkedin_url:
@@ -1957,256 +1917,58 @@ class MirageHybridSystem:
                     if emp and emp.employee_id:
                         m.matched_employee_id = emp.employee_id
 
-        # Flatten + sort all matches, keep up to TOP_K_CANDIDATES for the pool
+        # Flatten and select top TOP_K_MATCHES across all companies
         all_matches: List[EmployeeMatch] = []
         for company_matches in matches_by_company.values():
             all_matches.extend(company_matches)
         all_matches.sort(key=lambda m: m.similarity_score, reverse=True)
-        all_matches = all_matches[:TOP_K_CANDIDATES]
+        all_matches = all_matches[:TOP_K_MATCHES]
 
-        # Build serialisable candidate cards
-        candidate_pool: List[Dict] = []
-        for rank, m in enumerate(all_matches, start=1):
-            emp = emp_by_url.get((m.linkedin_url or "").strip().rstrip("/").lower())
-            candidate_pool.append({
-                "rank":             rank,
-                "linkedin_url":     m.linkedin_url,
-                "name":             m.competitor_employee,
-                "title":            m.competitor_role or (emp.title if emp else ""),
-                "company":          m.competitor_company,
-                "similarity_score": round(m.similarity_score, 1),
-                "confidence":       m.confidence,
-                "employee_id":      m.matched_employee_id,
-                "match_rationale":  m.match_rationale,
-                "matching_factors": m.matching_factors,
-                "source":           "discovered",
-            })
+        logger.info(f"Found {len(all_matches)} top matches across {len(matches_by_company)} companies")
 
-        # Persist pool + flip interaction_status
-        self.db_writer.save_candidate_pool(run_id, candidate_pool)
-
-        execution_time = time.time() - start_time
-        logger.info(
-            f"MIRAGE DISCOVERY COMPLETE: {len(candidate_pool)} candidates in {execution_time:.1f}s"
-        )
-
-        return {
-            "run_id": run_id,
-            "target_employee_id": employee_id,
-            "target_company_name": target_company_name,
-            "competitors": [asdict(c) for c in competitors],
-            "candidates": candidate_pool,
-            "total_candidates": len(candidate_pool),
-            "execution_time_seconds": round(execution_time, 2),
-            "cost_summary": _token_tracker.get_summary(),
-        }
-
-    async def run_enrichment_phase(
-        self,
-        run_id: str,
-        selected_urls: List[str],
-    ) -> Dict[str, Any]:
-        """
-        Phase 5–6: Enrich user-selected candidates and write final results.
-
-        `selected_urls` is the ordered list of LinkedIn URLs the user confirmed
-        (up to TOP_K_MATCHES).  May include URLs the user typed manually that
-        were not in the discovered pool.
-
-        The same run_id that was returned by run_discovery_phase is used, so
-        the downstream pipeline reads the same run without any changes.
-        """
-        if not run_id:
-            raise ValueError("run_id is required for the enrichment phase")
-        if not selected_urls:
-            raise ValueError("selected_urls must not be empty")
-
-        start_time = time.time()
-        logger.info("=" * 80)
-        logger.info(f"MIRAGE — ENRICHMENT PHASE START  run_id={run_id}")
-        logger.info("=" * 80)
-
-        # Load and validate the candidate pool written during discovery
-        candidate_pool = self.db_writer.load_candidate_pool(run_id)
-
-        # Resolve target employee_id from the run (needed to build EmployeeMatch objects)
-        employee_id, target_context = self.target_resolver.resolve_from_run_id(run_id)
-
-        # Build a lookup: normalised URL → candidate card
-        pool_by_url: Dict[str, Dict] = {}
-        for card in candidate_pool:
-            key = normalize_linkedin_url(card["linkedin_url"]).strip().rstrip("/").lower()
-            pool_by_url[key] = card
-
-        # Normalise + deduplicate the caller's selection, cap at TOP_K_MATCHES
-        seen_keys: set = set()
-        final_urls: List[str] = []
-        for url in selected_urls:
-            norm = normalize_linkedin_url(url).strip().rstrip("/").lower()
-            if norm and norm not in seen_keys:
-                seen_keys.add(norm)
-                final_urls.append(normalize_linkedin_url(url))
-        final_urls = final_urls[:TOP_K_MATCHES]
-
-        logger.info(f"[Confirm] User selected {len(final_urls)} URLs (cap={TOP_K_MATCHES})")
-
-        # Ensure every selected URL has a DB employee record.
-        # URLs from the pool already have employee_ids; user-added URLs may not.
-        all_employees: Dict[str, CompetitorEmployee] = {}  # employee_id → CompetitorEmployee
-        selected_matches: List[EmployeeMatch] = []
-
-        with self.conn.cursor() as cur:
-            for raw_url in final_urls:
-                norm_key = raw_url.strip().rstrip("/").lower()
-                card = pool_by_url.get(norm_key)
-
-                if card:
-                    # Known candidate from discovery
-                    eid = card["employee_id"]
-                    emp = CompetitorEmployee(
-                        name=card["name"],
-                        title=card["title"],
-                        company=card["company"],
-                        linkedin_url=card["linkedin_url"],
-                        search_snippet=card.get("match_rationale", ""),
-                        employee_id=eid,
-                        canonical_linkedin_id=canonicalize_linkedin_url(card["linkedin_url"]),
-                    )
-                    all_employees[eid] = emp
-                    selected_matches.append(EmployeeMatch(
-                        similarity_score=card["similarity_score"],
-                        target_employee_id=employee_id,
-                        matched_employee_id=eid,
-                        target_employee=target_context["employee_name"],
-                        competitor_employee=card["name"],
-                        competitor_company=card["company"],
-                        match_rationale=card.get("match_rationale", ""),
-                        linkedin_url=card["linkedin_url"],
-                        competitor_role=card["title"],
-                        matching_factors=card.get("matching_factors", {}),
-                        confidence=card.get("confidence", "medium"),
-                        notes="user_selected",
-                    ))
-                else:
-                    # User-added URL not in the discovered pool — look up or create employee
-                    canonical_id = canonicalize_linkedin_url(raw_url)
-                    eid = None
-                    if canonical_id:
-                        cur.execute(
-                            "SELECT employee_id, full_name, current_title, current_company_id "
-                            "FROM spectre.employees WHERE canonical_linkedin_id = %s LIMIT 1",
-                            (canonical_id,),
-                        )
-                        row = cur.fetchone()
-                        if row:
-                            eid = row["employee_id"]
-                            emp_name = row["full_name"] or ""
-                            emp_title = row["current_title"] or ""
-                        else:
-                            # Insert a stub; Bright Data will hydrate the rest
-                            eid = str(uuid.uuid4())
-                            emp_name = ""
-                            emp_title = ""
-                            cur.execute(
-                                """INSERT INTO spectre.employees (
-                                    employee_id, full_name, current_title,
-                                    linkedin_url, canonical_linkedin_id,
-                                    raw_json, profile_cache_text,
-                                    last_processed_run_id, created_at
-                                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())
-                                ON CONFLICT (employee_id) DO NOTHING""",
-                                (eid, emp_name, emp_title, raw_url, canonical_id,
-                                 Json({"source": "user_added", "run_id": run_id}),
-                                 "Added by user via MIRAGE interactive", run_id),
-                            )
-                            logger.info(f"[Confirm] Inserted stub employee {eid} for {raw_url}")
-
-                    if not eid:
-                        logger.warning(f"[Confirm] Could not resolve employee for {raw_url}, skipping")
-                        continue
-
-                    emp = CompetitorEmployee(
-                        name=emp_name,
-                        title=emp_title,
-                        company="",
-                        linkedin_url=raw_url,
-                        search_snippet="",
-                        employee_id=eid,
-                        canonical_linkedin_id=canonical_id,
-                    )
-                    all_employees[eid] = emp
-                    selected_matches.append(EmployeeMatch(
-                        similarity_score=100.0,   # user explicitly chose this person
-                        target_employee_id=employee_id,
-                        matched_employee_id=eid,
-                        target_employee=target_context["employee_name"],
-                        competitor_employee=emp_name or raw_url,
-                        competitor_company="",
-                        match_rationale="Manually added by user",
-                        linkedin_url=raw_url,
-                        competitor_role=emp_title,
-                        matching_factors={},
-                        confidence="user_selected",
-                        notes="user_added",
-                    ))
-
-        if not selected_matches:
-            raise ValueError("No valid employees could be resolved from the selected URLs")
-
-        # ── Phase 5: Bright Data enrichment ──
-        self.db_writer.mark_confirmed(run_id)
+        # Phase 5: Enrich with Bright Data
+        employee_lookup = {emp.employee_id: emp for emp in all_competitor_employees if emp.employee_id}
         enriched_matches, bright_profiles = self.enricher.enrich_matched_employees(
-            selected_matches, all_employees, run_id,
+            all_matches, employee_lookup, run_id,
         )
 
-        # ── Phase 6: Write to DB (same tables, same run_id — pipeline unchanged) ──
+        # Phase 6: Write to DB
         self.db_writer.write_matches(run_id, enriched_matches)
         self.db_writer.write_match_details(
-            run_id, enriched_matches, all_employees, bright_profiles,
+            run_id, enriched_matches, employee_lookup, bright_profiles,
             title_extractor=self.title_extractor,
         )
 
         execution_time = time.time() - start_time
         summary = {
             "target_employee_id": employee_id,
-            "target_company_name": target_context["company_name"],
+            "target_company_id": target_company_id,
+            "target_company_name": target_company_name,
+            "num_competitors": len(competitors),
+            "competitors_with_matches": len(matches_by_company),
+            "total_discovered_employees": len(all_competitor_employees),
             "total_matches": len(enriched_matches),
-            "user_selected_count": len([m for m in enriched_matches if m.notes == "user_selected"]),
-            "user_added_count": len([m for m in enriched_matches if m.notes == "user_added"]),
+            "matches_by_company": {k: len(v) for k, v in matches_by_company.items()},
             "execution_time_seconds": round(execution_time, 2),
-            "matching_algorithm": "interactive_v7.0",
+            "business_model": BUSINESS_MODEL,
+            "matching_algorithm": "4-weight_per_company_v7.0",
             "completed_at": datetime.now().isoformat(),
         }
         self.db_writer.update_run_status(run_id, "completed", summary)
 
-        logger.info(f"MIRAGE ENRICHMENT COMPLETE: {len(enriched_matches)} matches in {execution_time:.1f}s")
+        logger.info(f"MIRAGE COMPLETE: {len(enriched_matches)} matches in {execution_time:.1f}s")
 
         return {
             "run_id": run_id,
             "target_employee_id": employee_id,
-            "target_company_name": target_context["company_name"],
-            "competitors": [],
-            "matches_by_company": {},
+            "target_company_name": target_company_name,
+            "competitors": [asdict(c) for c in competitors],
+            "matches_by_company": {k: len(v) for k, v in matches_by_company.items()},
             "total_matches": len(enriched_matches),
             "execution_time_seconds": round(execution_time, 2),
             "summary": summary,
             "cost_summary": _token_tracker.get_summary(),
         }
-
-    async def run_full_analysis(
-        self, employee_id: Optional[str] = None, run_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """
-        Non-interactive shim: runs discovery then immediately confirms the
-        top TOP_K_MATCHES candidates.  Preserves the original /peers endpoint
-        behaviour so nothing else in the pipeline changes.
-        """
-        discovery = await self.run_discovery_phase(employee_id=employee_id, run_id=run_id)
-        top_urls = [c["linkedin_url"] for c in discovery["candidates"][:TOP_K_MATCHES]]
-        return await self.run_enrichment_phase(
-            run_id=discovery["run_id"],
-            selected_urls=top_urls,
-        )
 
 
 # =============================================================================
@@ -2223,31 +1985,10 @@ app = FastAPI(
 )
 
 
+
 class AnalysisRequest(BaseModel):
     employee_id: Optional[str] = Field(default=None, description="UUID of the target employee")
     run_id: Optional[str] = Field(default=None, description="UUID of an existing run")
-
-
-class DiscoverResponse(BaseModel):
-    run_id: str
-    target_employee_id: str
-    target_company_name: str
-    competitors: List[Dict[str, Any]]
-    candidates: List[Dict[str, Any]]
-    total_candidates: int
-    execution_time_seconds: float
-    cost_summary: Dict[str, Any]
-
-
-class ConfirmRequest(BaseModel):
-    run_id: str = Field(..., description="run_id returned by /peers/discover")
-    selected_urls: List[str] = Field(
-        ...,
-        description=(
-            "Ordered list of LinkedIn URLs to enrich (up to 8). "
-            "May include URLs not in the candidate pool (user-added friends/contacts)."
-        ),
-    )
 
 
 class AnalysisResponse(BaseModel):
@@ -2272,68 +2013,13 @@ def get_mirage() -> MirageHybridSystem:
     return _mirage_instance
 
 
-@app.get("/health")
-async def health_check():
-    return {"status": "ok", "version": "7.0", "service": "mirage-hybrid"}
-
-
-@app.post("/peers/discover", response_model=DiscoverResponse)
-async def run_discover(req: AnalysisRequest):
-    """
-    Phase 0–4: Discover and score candidate matches.
-
-    Returns a ranked candidate pool for the user to review.  The run_id in
-    the response must be passed to POST /peers/confirm once the user has
-    made their selection.
-    """
-    if not req.employee_id and not req.run_id:
-        raise HTTPException(status_code=400, detail="Must provide employee_id or run_id")
-    try:
-        mirage = get_mirage()
-        result = await mirage.run_discovery_phase(
-            employee_id=req.employee_id, run_id=req.run_id,
-        )
-        return DiscoverResponse(**result)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        logger.error(f"Discovery failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/peers/confirm", response_model=AnalysisResponse)
-async def run_confirm(req: ConfirmRequest):
-    """
-    Phase 5–6: Enrich the user-selected candidates and write final results.
-
-    Pass the run_id from /peers/discover plus a list of up to 8 LinkedIn URLs
-    the user chose (may include URLs not in the original candidate pool).
-    The final DB writes use the same run_id so the downstream pipeline is
-    completely unaffected.
-    """
-    if not req.selected_urls:
-        raise HTTPException(status_code=400, detail="selected_urls must not be empty")
-    try:
-        mirage = get_mirage()
-        result = await mirage.run_enrichment_phase(
-            run_id=req.run_id,
-            selected_urls=req.selected_urls,
-        )
-        return AnalysisResponse(**result)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        logger.error(f"Enrichment failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+# @app.get("/health")
+# async def health_check():
+#     return {"status": "ok", "version": "7.0", "service": "mirage-hybrid"}
 
 
 @app.post("/peers", response_model=AnalysisResponse)
 async def run_analysis(req: AnalysisRequest):
-    """
-    Legacy non-interactive endpoint.  Runs the full pipeline (discovery +
-    auto-confirm top 8) in one shot.  Existing integrations continue to work
-    without any changes.
-    """
     if not req.employee_id and not req.run_id:
         raise HTTPException(status_code=400, detail="Must provide employee_id, run_id, or both")
     try:
@@ -2359,10 +2045,6 @@ async def cli_main():
     parser = argparse.ArgumentParser(description="MIRAGE Hybrid v7.0")
     parser.add_argument("--employee-id", default=None, help="UUID of target employee")
     parser.add_argument("--run-id", default=None, help="UUID of an existing run")
-    parser.add_argument(
-        "--non-interactive", action="store_true",
-        help="Skip user selection and auto-confirm the top candidates (original behaviour)",
-    )
     args = parser.parse_args()
 
     if not args.employee_id and not args.run_id:
@@ -2373,110 +2055,23 @@ async def cli_main():
         print(f"Employee ID: {args.employee_id}")
     if args.run_id:
         print(f"Run ID: {args.run_id}")
-    print(
-        f"Competitors: {NUM_COMPETITORS}  |  Mode: {BUSINESS_MODEL}  |  "
-        f"Top matches: {TOP_K_MATCHES}  |  Per company: {MATCHES_PER_COMPANY}"
-    )
+    print(f"Competitors: {NUM_COMPETITORS}  |  Mode: {BUSINESS_MODEL}  |  "
+          f"Top matches: {TOP_K_MATCHES}  |  Per company: {MATCHES_PER_COMPANY}")
     print(f"Weights: Company(30) + Role(30) + Department(20) + Experience(20)\n{'=' * 80}")
 
     try:
         mirage = MirageHybridSystem()
-
-        # ── Discovery ──
-        print("\n[MIRAGE] Running discovery phase …\n")
-        discovery = await mirage.run_discovery_phase(
+        results = await mirage.run_full_analysis(
             employee_id=args.employee_id, run_id=args.run_id,
-        )
-
-        run_id = discovery["run_id"]
-        candidates = discovery["candidates"]
-
-        print(f"\n{'=' * 80}")
-        print(f"DISCOVERY COMPLETE  —  run_id: {run_id}")
-        print(f"Target: {discovery['target_company_name']}")
-        print(f"{'=' * 80}")
-        print(f"\n{'#':>3}  {'Score':>6}  {'Confidence':<12}  {'Name':<28}  {'Title':<30}  Company")
-        print("-" * 110)
-        for c in candidates:
-            print(
-                f"{c['rank']:>3}  {c['similarity_score']:>6.1f}  {c['confidence']:<12}  "
-                f"{c['name']:<28}  {c['title']:<30}  {c['company']}"
-            )
-        print("-" * 110)
-
-        # ── Selection ──
-        if args.non_interactive:
-            # Auto-confirm top TOP_K_MATCHES
-            selected_urls = [c["linkedin_url"] for c in candidates[:TOP_K_MATCHES]]
-            print(f"\n[--non-interactive] Auto-selected top {len(selected_urls)} candidates.")
-        else:
-            print(
-                f"\nSelect up to {TOP_K_MATCHES} candidates by entering their rank numbers "
-                f"(comma-separated).\nPress Enter to accept the top {TOP_K_MATCHES} automatically."
-            )
-            raw_ranks = input("Your selection (e.g. 1,3,5): ").strip()
-
-            if raw_ranks:
-                try:
-                    chosen_ranks = [int(x.strip()) for x in raw_ranks.split(",") if x.strip()]
-                    rank_to_url = {c["rank"]: c["linkedin_url"] for c in candidates}
-                    selected_urls = [
-                        rank_to_url[r] for r in chosen_ranks
-                        if r in rank_to_url
-                    ][:TOP_K_MATCHES]
-                    if not selected_urls:
-                        print("[WARN] No valid ranks entered — defaulting to top candidates.")
-                        selected_urls = [c["linkedin_url"] for c in candidates[:TOP_K_MATCHES]]
-                except ValueError:
-                    print("[WARN] Could not parse ranks — defaulting to top candidates.")
-                    selected_urls = [c["linkedin_url"] for c in candidates[:TOP_K_MATCHES]]
-            else:
-                selected_urls = [c["linkedin_url"] for c in candidates[:TOP_K_MATCHES]]
-                print(f"Accepted top {len(selected_urls)} candidates.")
-
-            # Allow manual additions (friends / known contacts)
-            slots_left = TOP_K_MATCHES - len(selected_urls)
-            if slots_left > 0:
-                print(
-                    f"\nYou have {slots_left} slot(s) remaining. "
-                    "Add LinkedIn URLs manually (comma-separated), or press Enter to skip."
-                )
-                raw_manual = input("Manual URLs: ").strip()
-                if raw_manual:
-                    manual_urls = [u.strip() for u in raw_manual.split(",") if u.strip()]
-                    added = 0
-                    for url in manual_urls:
-                        if added >= slots_left:
-                            break
-                        norm = normalize_linkedin_url(url)
-                        if norm not in selected_urls:
-                            selected_urls.append(norm)
-                            added += 1
-                    if added:
-                        print(f"Added {added} manual URL(s).")
-
-            print(f"\nFinal selection ({len(selected_urls)} profiles):")
-            for i, url in enumerate(selected_urls, 1):
-                print(f"  {i}. {url}")
-
-            confirm = input("\nProceed with enrichment? [Y/n]: ").strip().lower()
-            if confirm in ("n", "no"):
-                print("Aborted by user.")
-                return
-
-        # ── Enrichment ──
-        print("\n[MIRAGE] Running enrichment phase …\n")
-        results = await mirage.run_enrichment_phase(
-            run_id=run_id,
-            selected_urls=selected_urls,
         )
 
         print(f"\n{'=' * 80}\nRESULTS\n{'=' * 80}")
         print(f"Run ID: {results['run_id']}")
         print(f"Target: {results['target_company_name']}")
-        print(f"Final matches written: {results['total_matches']}")
-        print(f"Time: {results['execution_time_seconds']}s")
-        print(f"{'=' * 80}")
+        print(f"Matches: {results['total_matches']}")
+        for comp, count in results.get("matches_by_company", {}).items():
+            print(f"  - {comp}: {count}")
+        print(f"Time: {results['execution_time_seconds']}s\n{'=' * 80}")
         _token_tracker.print_summary()
 
     except Exception as e:
