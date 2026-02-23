@@ -38,7 +38,7 @@ except ImportError:
     AzureOpenAI = None
 
 try:
-    from fastapi import FastAPI, HTTPException
+    from fastapi import FastAPI, APIRouter, HTTPException
     from pydantic import BaseModel
     import uvicorn
 except ImportError:
@@ -626,44 +626,41 @@ def _build_vitals_blob(data: Dict) -> str:
 
 
 # ── FastAPI App ──────────────────────────────────────────────
-if FastAPI:
-    app = FastAPI(title="Agent 3 — Skill Extraction", version="2.0")
+app = FastAPI(title="Agent 3 — Skill Extraction", version="2.0")
+router = APIRouter(prefix="/cipher", tags=["Cipher"])
 
-    class EmployeeRequest(BaseModel):
-        employee_id: str
-        run_id: Optional[str] = None
+class EmployeeRequest(BaseModel):
+    employee_id: str
+    run_id: Optional[str] = None
 
-    class RunRequest(BaseModel):
-        run_id: str
+class RunRequest(BaseModel):
+    run_id: str
 
-    @app.post("/skills/employee")
-    def extract_employee(req: EmployeeRequest):
-        extractor = SkillExtractor()
-        try:
-            result = extractor.process_employee(req.employee_id, req.run_id)
-            if not result["success"]:
-                raise HTTPException(status_code=404, detail=result["error"])
-            return result
-        finally:
-            extractor.close()
+@router.post("/skills/employee")
+def extract_employee(req: EmployeeRequest):
+    extractor = SkillExtractor()
+    try:
+        result = extractor.process_employee(req.employee_id, req.run_id)
+        if not result["success"]:
+            raise HTTPException(status_code=404, detail=result["error"])
+        return result
+    finally:
+        extractor.close()
 
-    @app.post("/skills/run")
-    def extract_run(req: RunRequest):
-        extractor = SkillExtractor()
-        try:
-            result = extractor.process_run(req.run_id)
-            if not result["success"]:
-                raise HTTPException(status_code=404, detail=result["error"])
-            return result
-        finally:
-            extractor.close()
+@router.post("/skills/run")
+def extract_run(req: RunRequest):
+    extractor = SkillExtractor()
+    try:
+        result = extractor.process_run(req.run_id)
+        if not result["success"]:
+            raise HTTPException(status_code=404, detail=result["error"])
+        return result
+    finally:
+        extractor.close()
 
-    @app.get("/health")
-    def health():
-        return {"status": "ok", "agent": "agent3_db", "version": "2.0"}
-
-else:
-    app = None
+@router.get("/health")
+def health():
+    return {"status": "ok", "agent": "agent3_db", "version": "2.0"}
 
 
 # ── CLI ──────────────────────────────────────────────────────

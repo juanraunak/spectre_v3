@@ -2213,14 +2213,15 @@ class MirageHybridSystem:
 # FastAPI Application
 # =============================================================================
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-app = FastAPI(
-    title="MIRAGE Hybrid API",
-    description="Competitive intelligence employee matching system",
-    version="7.0",
-)
+# app = FastAPI(
+#     title="MIRAGE Hybrid API",
+#     description="Competitive intelligence employee matching system",
+#     version="7.0",
+# )
+router = APIRouter(prefix="/mirage", tags=["Mirage"])
 
 
 class AnalysisRequest(BaseModel):
@@ -2272,12 +2273,12 @@ def get_mirage() -> MirageHybridSystem:
     return _mirage_instance
 
 
-@app.get("/health")
+@router.get("/health")
 async def health_check():
     return {"status": "ok", "version": "7.0", "service": "mirage-hybrid"}
 
 
-@app.post("/peers/discover", response_model=DiscoverResponse)
+@router.post("/peers/discover", response_model=DiscoverResponse)
 async def run_discover(req: AnalysisRequest):
     """
     Phase 0–4: Discover and score candidate matches.
@@ -2301,7 +2302,7 @@ async def run_discover(req: AnalysisRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/peers/confirm", response_model=AnalysisResponse)
+@router.post("/peers/confirm", response_model=AnalysisResponse)
 async def run_confirm(req: ConfirmRequest):
     """
     Phase 5–6: Enrich the user-selected candidates and write final results.
@@ -2327,7 +2328,7 @@ async def run_confirm(req: ConfirmRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/peers", response_model=AnalysisResponse)
+@router.post("/peers", response_model=AnalysisResponse)
 async def run_analysis(req: AnalysisRequest):
     """
     Legacy non-interactive endpoint.  Runs the full pipeline (discovery +

@@ -1,15 +1,15 @@
 import os
 import uuid
 from typing import List, Any, Dict
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, APIRouter, HTTPException
 from pydantic import BaseModel
 import psycopg2
 import psycopg2.extras
 
 DATABASE_URL =     "postgresql://monsteradmin:M0nsteradmin@monsterdb.postgres.database.azure.com:5432/postgres?sslmode=require"
 
-app = FastAPI(title="Spectre Data API")
-
+#app = FastAPI(title="Spectre Data API")
+router = APIRouter(prefix="/fetch", tags=["Fetch Data"])
 def get_connection():
     print("Connecting to database...")
     return psycopg2.connect(DATABASE_URL)
@@ -57,7 +57,7 @@ class EmployeeRequest(BaseModel):
 class SkillRequest(BaseModel):
     skill_id: uuid.UUID
 
-@app.post("/run")
+@router.post("/run")
 def get_run(req: RunRequest):
     print("POST /run")
     result = fetch_one(
@@ -69,7 +69,7 @@ def get_run(req: RunRequest):
     return result
 
 
-@app.post("/run/companies")
+@router.post("/run/companies")
 def get_run_companies(req: RunRequest):
     print("POST /run/companies")
     return fetch_all(
@@ -78,7 +78,7 @@ def get_run_companies(req: RunRequest):
     )
 
 
-@app.post("/run/employees")
+@router.post("/run/employees")
 def get_run_employees(req: RunRequest):
     print("POST /run/employees")
     return fetch_all(
@@ -87,7 +87,7 @@ def get_run_employees(req: RunRequest):
     )
 
 
-@app.post("/run/employee-details")
+@router.post("/run/employee-details")
 def get_employee_details(req: RunRequest):
     print("POST /run/employee-details")
     return fetch_all(
@@ -96,7 +96,7 @@ def get_employee_details(req: RunRequest):
     )
 
 
-@app.post("/run/employee-reports")
+@router.post("/run/employee-reports")
 def get_employee_reports(req: RunRequest):
     print("POST /run/employee-reports")
     return fetch_all(
@@ -105,7 +105,7 @@ def get_employee_reports(req: RunRequest):
     )
 
 
-@app.post("/run/employee-matches")
+@router.post("/run/employee-matches")
 def get_employee_matches(req: RunRequest):
     print("POST /run/employee-matches")
     return fetch_all(
@@ -114,7 +114,7 @@ def get_employee_matches(req: RunRequest):
     )
 
 
-@app.post("/run/employee-skills")
+@router.post("/run/employee-skills")
 def get_employee_skills(req: RunRequest):
     print("POST /run/employee-skills")
     return fetch_all(
@@ -123,7 +123,7 @@ def get_employee_skills(req: RunRequest):
     )
 
 
-@app.post("/run/employee-skill-gaps")
+@router.post("/run/employee-skill-gaps")
 def get_employee_skill_gaps(req: RunRequest):
     print("POST /run/employee-skill-gaps")
     return fetch_all(
@@ -132,7 +132,7 @@ def get_employee_skill_gaps(req: RunRequest):
     )
 
 
-@app.post("/run/employee-courses")
+@router.post("/run/employee-courses")
 def get_employee_courses(req: RunRequest):
     print("POST /run/employee-courses")
     return fetch_all(
@@ -140,7 +140,7 @@ def get_employee_courses(req: RunRequest):
         (req.run_id,)
     )
 
-@app.post("/company")
+@router.post("/company")
 def get_company(req: CompanyRequest):
     print("POST /company")
     result = fetch_one(
@@ -152,7 +152,7 @@ def get_company(req: CompanyRequest):
     return result
 
 
-@app.post("/employee")
+@router.post("/employee")
 def get_employee(req: EmployeeRequest):
     print("POST /employee")
     result = fetch_one(
@@ -164,7 +164,7 @@ def get_employee(req: EmployeeRequest):
     return result
 
 
-@app.post("/skill")
+@router.post("/skill")
 def get_skill(req: SkillRequest):
     print("POST /skill")
     result = fetch_one(

@@ -32,7 +32,7 @@ from cost_tracker import get_cost_tracker
 
 import aiohttp
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, APIRouter, HTTPException
 from pydantic import BaseModel
 import uvicorn
 
@@ -1784,8 +1784,8 @@ def run(context: Dict[str, Any]) -> Dict[str, Any]:
 # FastAPI
 # =============================================================================
 
-app = FastAPI(title="SHADE API", version="1.0.0")
-
+# app = FastAPI(title="SHADE API", version="1.0.0")
+router = APIRouter(prefix="/shade", tags=["Shade"])
 
 class B2CRequest(BaseModel):
     linkedin_url: str
@@ -1809,12 +1809,12 @@ class ShadeResponse(BaseModel):
     error: Optional[str] = None
 
 
-@app.get("/health")
+@router.get("/health")
 def health():
     return {"status": "ok"}
 
 
-@app.post("/run/b2c", response_model=ShadeResponse)
+@router.post("/run/b2c", response_model=ShadeResponse)
 def run_b2c(req: B2CRequest):
     if not req.linkedin_url or "linkedin.com" not in req.linkedin_url:
         raise HTTPException(status_code=400, detail="A valid LinkedIn profile URL is required.")
@@ -1844,7 +1844,7 @@ def run_b2c(req: B2CRequest):
     )
 
 
-@app.post("/run/b2b", response_model=ShadeResponse)
+@router.post("/run/b2b", response_model=ShadeResponse)
 def run_b2b(req: B2BRequest):
     if not req.company_name.strip():
         raise HTTPException(status_code=400, detail="company_name is required.")

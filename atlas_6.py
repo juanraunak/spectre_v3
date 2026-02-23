@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 # ────────────────────────────────────────────────────────────────
@@ -1954,8 +1954,8 @@ def run_atlas(run_id, employee_id, azure_api_key="", db_host="", db_port=5432,
 #  9.  FASTAPI
 # ════════════════════════════════════════════════════════════════
 
-app = FastAPI(title="Atlas v2.4 — Multi-Axis Skill Intelligence API", version="2.4")
-
+# app = FastAPI(title="Atlas v2.4 — Multi-Axis Skill Intelligence API", version="2.4")
+router = APIRouter(prefix="/atlas", tags=["Atlas"])
 
 class AtlasRequest(BaseModel):
     run_id: str = Field(...)
@@ -1981,13 +1981,13 @@ class AtlasResponse(BaseModel):
     report: Dict[str, Any]
 
 
-@app.get("/health")
+@router.get("/health")
 def health_check():
     return {"status": "ok", "service": "atlas_v2.4", "version": "2.4",
             "axesPerDimension": NUM_AXES, "totalCombinations": NUM_AXES ** 2}
 
 
-@app.post("/atlas/report", response_model=AtlasResponse)
+@router.post("/atlas/report", response_model=AtlasResponse)
 def generate_atlas_report(req: AtlasRequest):
     try:
         employee_id = req.employee_id
@@ -2015,7 +2015,7 @@ def generate_atlas_report(req: AtlasRequest):
         raise HTTPException(status_code=500, detail=f"Internal error: {e}")
 
 
-@app.get("/atlas/report")
+@router.get("/atlas/report")
 def generate_atlas_report_get(run_id: str = Query(...), employee_id: Optional[str] = Query(None),
                               max_peers: int = Query(10, ge=1, le=50)):
     try:

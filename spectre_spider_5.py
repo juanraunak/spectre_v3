@@ -22,7 +22,7 @@ from aiohttp import ClientSession
 from bs4 import BeautifulSoup
 import asyncpg
 from asyncpg import Connection, Pool
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 try:
@@ -1227,13 +1227,13 @@ async def _lifespan(application: FastAPI):
     await db_pool.close()
 
 
-app = FastAPI(
-    title="SPECTRE Agent 5",
-    description="Hyper-personalised course generation from employee skill gaps",
-    version="5.2.0",
-    lifespan=_lifespan,
-)
-
+# app = FastAPI(
+#     title="SPECTRE Agent 5",
+#     description="Hyper-personalised course generation from employee skill gaps",
+#     version="5.2.0",
+#     lifespan=_lifespan,
+# )
+router = APIRouter(prefix="/spectre", tags=["Spectre"])
 
 class GenerateRequest(BaseModel):
     run_id: Optional[str] = None
@@ -1248,7 +1248,7 @@ class CourseResponse(BaseModel):
     cost: Optional[Dict[str, Any]] = None
 
 
-@app.post("/generate", response_model=CourseResponse)
+@router.post("/generate", response_model=CourseResponse)
 async def api_generate_courses(
     body: Optional[GenerateRequest] = None,
     run_id: Optional[str] = Query(None, description="UUID of the run → finds primary employee"),
@@ -1274,7 +1274,7 @@ async def api_generate_courses(
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@app.get("/health")
+@router.get("/health")
 async def health():
     return {"status": "ok"}
 

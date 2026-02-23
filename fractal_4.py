@@ -45,7 +45,7 @@ except ImportError:
 
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, APIRouter, HTTPException
 from pydantic import BaseModel
 
 try:
@@ -1533,8 +1533,8 @@ def run_sync(context: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # FastAPI
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Agent 4 — Skill Gap Analyzer", version="2.0.0")
-
+#app = FastAPI(title="Agent 4 — Skill Gap Analyzer", version="2.0.0")
+router = APIRouter(prefix="/fractal", tags=["Fractal"])
 
 class AnalyzeRequest(BaseModel):
     run_id: Optional[str] = None
@@ -1570,7 +1570,7 @@ class AnalyzeResponse(BaseModel):
     cost: CostInfo
 
 
-@app.post("/analyze", response_model=AnalyzeResponse)
+@router.post("/analyze", response_model=AnalyzeResponse)
 def api_analyze(req: AnalyzeRequest):
     """
     Run skill gap analysis. Accepts:
@@ -1630,7 +1630,7 @@ def api_analyze(req: AnalyzeRequest):
     )
 
 
-@app.get("/health")
+@router.get("/health")
 def health():
     return {"status": "ok", "agent": "agent4_db_skill_gap", "version": "2.0.0",
             "features": ["peer_comparison", "future_readiness"]}
