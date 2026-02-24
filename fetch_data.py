@@ -5,6 +5,7 @@ from fastapi import FastAPI, APIRouter, HTTPException
 from pydantic import BaseModel
 import psycopg2
 import psycopg2.extras
+psycopg2.extras.register_uuid()
 
 DATABASE_URL =     "postgresql://monsteradmin:M0nsteradmin@monsterdb.postgres.database.azure.com:5432/postgres?sslmode=require"
 
