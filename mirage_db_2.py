@@ -494,7 +494,7 @@ class TargetResolver:
             )
             row = cur.fetchone()
             if row:
-                employee_id = row["employee_id"]
+                employee_id = str(row["employee_id"])  # cast to str
                 logger.info(f"[Phase 0] Found employee in run_employees: {employee_id} (role: {row['role_in_run']})")
 
             # 2) Fallback: check runs.raw_json
@@ -505,7 +505,7 @@ class TargetResolver:
                     raw = run_row.get("raw_json") or {}
                     if isinstance(raw, str):
                         raw = json.loads(raw)
-                    employee_id = raw.get("target_employee_id")
+                    employee_id = str(raw.get("target_employee_id"))
                     if employee_id:
                         logger.info(f"[Phase 0] Found target employee in runs.raw_json: {employee_id}")
 
@@ -1666,6 +1666,9 @@ class MirageDBWriter:
         logger.info(f"[DB] Writing {len(matches)} matches")
         with self.conn.cursor() as cur:
             for m in matches:
+                if not m.matched_employee_id:
+                    print(f"Skipping match for {m.competitor_employee} — no matched_employee_id")
+                    continue
                 cur.execute(
                     """SELECT 1 FROM spectre.employee_matches
                        WHERE run_id=%s AND employee_id=%s AND matched_employee_id=%s LIMIT 1""",
@@ -1976,7 +1979,7 @@ class MirageHybridSystem:
                 "company":          m.competitor_company,
                 "similarity_score": round(m.similarity_score, 1),
                 "confidence":       m.confidence,
-                "employee_id":      m.matched_employee_id,
+                "employee_id":      str(m.matched_employee_id) if m.matched_employee_id else None,   #converts any uuid to string
                 "match_rationale":  m.match_rationale,
                 "matching_factors": m.matching_factors,
                 "source":           "discovered",
@@ -2057,12 +2060,15 @@ class MirageHybridSystem:
 
         with self.conn.cursor() as cur:
             for raw_url in final_urls:
-                norm_key = raw_url.strip().rstrip("/").lower()
+                norm_key = normalize_linkedin_url(raw_url).strip().rstrip("/").lower()
                 card = pool_by_url.get(norm_key)
 
                 if card:
                     # Known candidate from discovery
                     eid = card["employee_id"]
+                    if not eid:
+                        print(f"Skipping pool candidate {card.get('name')} — no employee_id in pool card")
+                        continue
                     emp = CompetitorEmployee(
                         name=card["name"],
                         title=card["title"],
